@@ -1,8 +1,9 @@
 # vault-init
 
-The `vault-init` service automates the process of [initializing](https://www.vaultproject.io/docs/commands/operator/init.html) and [unsealing](https://www.vaultproject.io/docs/concepts/seal.html#unsealing) HashiCorp Vault instances running on [Google Cloud Platform](https://cloud.google.com).
+This is a fork of [sethvargo/vault-init](https://github.com/sethvargo/vault-init) with the following key differences:
 
-After `vault-init` initializes a Vault server it stores master keys and root tokens, encrypted using [Google Cloud KMS](https://cloud.google.com/kms), to a user defined [Google Cloud Storage](https://cloud.google.com/storage) bucket.
+- Root token and unseal keys are encrypted / decrypted with AWS KMS instead of Google Cloud KMS
+- Encrypted root token and unseal keys are stored within a Kubernetes Secret instead of Google Cloud Storage
 
 ## Usage
 
@@ -13,7 +14,7 @@ You can download the code and compile the binary with Go. Alternatively, a
 Docker container is available via the Docker Hub:
 
 ```text
-$ docker pull sethvargo/vault-init
+$ docker pull ghcr.io/liatrio/vault-init
 ```
 
 To use this as part of a Kubernetes Vault Deployment:
@@ -21,13 +22,32 @@ To use this as part of a Kubernetes Vault Deployment:
 ```yaml
 containers:
 - name: vault-init
-  image: registry.hub.docker.com/sethvargo/vault-init:0.1.2
+  image: ghcr.io/liatrio/vault-init:latest
   imagePullPolicy: Always
   env:
-  - name: GCS_BUCKET_NAME
-    value: my-gcs-bucket
+  - name: K8S_SECRET_NAME
+    value: my-k8s-secret
   - name: KMS_KEY_ID
-    value: projects/my-project/locations/my-location/cryptoKeys/my-key
+    value: arn:aws:kms:us-east-1:112233445566:key/f30464ff-5082-453b-8604-463c07d86d27
+  - name: KMS_REGION
+    value: us-east-1
+```
+
+You can also use this alongside the official Vault Helm chart:
+
+```yaml
+server:
+  extraContainers:
+    - name: vault-init
+      image: ghcr.io/liatrio/vault-init:latest
+      imagePullPolicy: Always
+      env:
+        - name: K8S_SECRET_NAME
+          value: my-k8s-secret
+        - name: KMS_KEY_ID
+          value: arn:aws:kms:us-east-1:112233445566:key/f30464ff-5082-453b-8604-463c07d86d27
+        - name: KMS_REGION
+          value: us-east-1
 ```
 
 ## Configuration
@@ -37,11 +57,13 @@ The `vault-init` service supports the following environment variables for config
 - `CHECK_INTERVAL` ("10s") - The time duration between Vault health checks. Set
   this to a negative number to unseal once and exit.
 
-- `GCS_BUCKET_NAME` - The Google Cloud Storage Bucket where the Vault master key
-  and root token is stored.
+- `K8S_SECRET_NAME` - The Kubernetes secret where the Vault master key
+  and root token is stored. The secret will be created in the same namespace as the Vault server pod.
 
-- `KMS_KEY_ID` - The Google Cloud KMS key ID used to encrypt and decrypt the
+- `KMS_KEY_ID` - The AWS KMS key ID used to encrypt and decrypt the
   vault master key and root token.
+
+- `KMS_REGION` - The region in which the AWS KMS key exists 
 
 - `VAULT_SECRET_SHARES` (5) - The number of human shares to create.
 
@@ -71,36 +93,51 @@ The `vault-init` service supports the following environment variables for config
 - `VAULT_TLS_SERVER_NAME` ("") - Custom SNI hostname to use when validating TLS
   connections to Vault.
 
-### Example Values
-
-```
-CHECK_INTERVAL="30s"
-GCS_BUCKET_NAME="vault-storage"
-KMS_KEY_ID="projects/my-project/locations/global/keyRings/my-keyring/cryptoKeys/key"
-```
-
 ### IAM &amp; Permissions
 
-The `vault-init` service uses the official Google Cloud Golang SDK. This means
-it supports the common ways of [providing credentials to GCP][cloud-creds].
+The `vault-init` service uses the official AWS Golang SDK. This means
+it supports the common ways of [providing credentials to AWS](https://docs.aws.amazon.com/sdk-for-go/v1/developer-guide/configuring-sdk.html#specifying-credentials).
 
-To use this service, the service account must have the following minimum
-scope(s):
+To use this service, the AWS service account must have the following permissions:
 
-```text
-https://www.googleapis.com/auth/cloudkms
-https://www.googleapis.com/auth/devstorage.read_write
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ],
+      "Effect": "Allow",
+      "Resource": "my-aws-kms-key-arn"
+    }
+  ]
+}
 ```
 
-Additionally, the service account must have the following minimum role(s):
+Additionally, Kubernetes service account for Vault needs to be able to create secrets, and read/update the desired secret
+if it already exists.  The following role can be used:
 
-```text
-roles/cloudkms.cryptoKeyEncrypterDecrypter
-roles/storage.objectAdmin OR roles/storage.legacyBucketWriter
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vault-credentials-manager
+rules:
+  - apiGroups:
+      - ""
+    resourceNames:
+      - vault-credentials # or whatever you set for the `K8S_SECRET_NAME` env var
+    resources:
+      - secrets
+    verbs:
+      - '*'
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
 ```
-
-For more information on service accounts, please see the
-[Google Cloud Service Accounts documentation][service-accounts].
-
-[cloud-creds]: https://cloud.google.com/docs/authentication/production#providing_credentials_to_your_application
-[service-accounts]: https://cloud.google.com/compute/docs/access/service-accounts

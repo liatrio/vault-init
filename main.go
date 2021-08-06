@@ -1,6 +1,8 @@
 // Copyright 2018 Google Inc. All Rights Reserved.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
+//
+// Modifications Copyright 2021 Liatrio
 
 package main
 
@@ -13,24 +15,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"strconv"
 	"syscall"
-	"time"
 
-	"cloud.google.com/go/storage"
-	"google.golang.org/api/cloudkms/v1"
-	"google.golang.org/api/option"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/kms"
+	"time"
 )
 
 var (
-	vaultAddr     string
-	gcsBucketName string
-	httpClient    *http.Client
+	vaultAddr  string
+	httpClient *http.Client
 
 	vaultSecretShares      int
 	vaultSecretThreshold   int
@@ -38,12 +43,13 @@ var (
 	vaultRecoveryShares    int
 	vaultRecoveryThreshold int
 
-	kmsService *cloudkms.Service
-	kmsKeyId   string
+	kmsKeyId  string
+	kmsRegion string
+	kmsSvc    *kms.KMS
 
-	storageClient *storage.Client
-
-	userAgent = fmt.Sprintf("vault-init/1.0.0 (%s)", runtime.Version())
+	k8sClient     *kubernetes.Clientset
+	k8sSecretName string
+	k8sNamespace  string
 )
 
 // InitRequest holds a Vault init request.
@@ -108,9 +114,9 @@ func main() {
 
 	checkInterval := durFromEnv("CHECK_INTERVAL", 10*time.Second)
 
-	gcsBucketName = os.Getenv("GCS_BUCKET_NAME")
-	if gcsBucketName == "" {
-		log.Fatal("GCS_BUCKET_NAME must be set and not empty")
+	k8sSecretName = os.Getenv("K8S_SECRET_NAME")
+	if k8sSecretName == "" {
+		log.Fatal("K8S_SECRET_NAME must be set and not empty")
 	}
 
 	kmsKeyId = os.Getenv("KMS_KEY_ID")
@@ -118,23 +124,36 @@ func main() {
 		log.Fatal("KMS_KEY_ID must be set and not empty")
 	}
 
-	kmsCtx, kmsCtxCancel := context.WithCancel(context.Background())
-	defer kmsCtxCancel()
-	kmsService, err = cloudkms.NewService(kmsCtx)
-	if err != nil {
-		log.Println(err)
-		return
+	kmsRegion = os.Getenv("KMS_REGION")
+	if kmsKeyId == "" {
+		log.Fatal("KMS_REGION must be set and not empty")
 	}
-	kmsService.UserAgent = userAgent
 
-	storageCtx, storageCtxCancel := context.WithCancel(context.Background())
-	defer storageCtxCancel()
-	storageClient, err = storage.NewClient(storageCtx,
-		option.WithUserAgent(userAgent),
-		option.WithScopes(storage.ScopeReadWrite))
+	var clusterConfig *rest.Config
+	clusterConfig, err = rest.InClusterConfig()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("error fetching cluster config: %v", err)
 	}
+
+	k8sClient, err = kubernetes.NewForConfig(clusterConfig)
+	if err != nil {
+		log.Fatalf("error creating kubernetes client: %v", err)
+	}
+
+	k8sNamespace, err = getCurrentNamespace()
+	if err != nil {
+		log.Fatalf("error getting current namespace: %v", err)
+	}
+
+	var sess *session.Session
+	sess, err = session.NewSession(&aws.Config{
+		Region: aws.String(kmsRegion),
+	})
+	if err != nil {
+		log.Fatalf("error creating AWS session: %v", err)
+	}
+
+	kmsSvc = kms.New(sess)
 
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: vaultInsecureSkipVerify,
@@ -155,8 +174,6 @@ func main() {
 
 	stop := func() {
 		log.Printf("Shutting down")
-		kmsCtxCancel()
-		storageCtxCancel()
 		os.Exit(0)
 	}
 
@@ -265,77 +282,84 @@ func initialize() {
 
 	log.Println("Encrypting unseal keys and the root token...")
 
-	rootTokenEncryptRequest := &cloudkms.EncryptRequest{
-		Plaintext: base64.StdEncoding.EncodeToString([]byte(initResponse.RootToken)),
-	}
-
-	rootTokenEncryptResponse, err := kmsService.Projects.Locations.KeyRings.CryptoKeys.Encrypt(kmsKeyId, rootTokenEncryptRequest).Do()
+	rootTokenEncryptResult, err := kmsSvc.Encrypt(&kms.EncryptInput{
+		KeyId:     aws.String(kmsKeyId),
+		Plaintext: []byte(initResponse.RootToken),
+	})
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	unsealKeysEncryptRequest := &cloudkms.EncryptRequest{
-		Plaintext: base64.StdEncoding.EncodeToString(initRequestResponseBody),
-	}
-
-	unsealKeysEncryptResponse, err := kmsService.Projects.Locations.KeyRings.CryptoKeys.Encrypt(kmsKeyId, unsealKeysEncryptRequest).Do()
+	unsealKeysEncryptResult, err := kmsSvc.Encrypt(&kms.EncryptInput{
+		KeyId:     aws.String(kmsKeyId),
+		Plaintext: initRequestResponseBody,
+	})
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	bucket := storageClient.Bucket(gcsBucketName)
+	secret, err := k8sClient.CoreV1().Secrets(k8sNamespace).Get(context.Background(), k8sSecretName, metav1.GetOptions{})
+	if err != nil && errors.IsNotFound(err) { // secret doesn't exist, we need to create
+		_, err = k8sClient.CoreV1().Secrets(k8sNamespace).Create(context.Background(), &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      k8sSecretName,
+				Namespace: k8sNamespace,
+			},
+			Data: map[string][]byte{
+				"unseal-keys.json.enc": unsealKeysEncryptResult.CiphertextBlob,
+				"root-token.enc":       rootTokenEncryptResult.CiphertextBlob,
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			log.Println(err)
+			return
+		}
+	} else if err == nil { // secret exists, we need to update
+		secret.Data["unseal-keys.json.enc"] = unsealKeysEncryptResult.CiphertextBlob
+		secret.Data["root-token.enc"] = rootTokenEncryptResult.CiphertextBlob
 
-	// Save the encrypted unseal keys.
-	ctx := context.Background()
-	unsealKeysObject := bucket.Object("unseal-keys.json.enc").NewWriter(ctx)
-	defer unsealKeysObject.Close()
-
-	_, err = unsealKeysObject.Write([]byte(unsealKeysEncryptResponse.Ciphertext))
-	if err != nil {
+		_, err = k8sClient.CoreV1().Secrets(k8sNamespace).Update(context.Background(), secret, metav1.UpdateOptions{})
+		if err != nil {
+			log.Println(err)
+			return
+		}
+	} else {
 		log.Println(err)
+		return
 	}
 
-	log.Printf("Unseal keys written to gs://%s/%s", gcsBucketName, "unseal-keys.json.enc")
-
-	// Save the encrypted root token.
-	rootTokenObject := bucket.Object("root-token.enc").NewWriter(ctx)
-	defer rootTokenObject.Close()
-
-	_, err = rootTokenObject.Write([]byte(rootTokenEncryptResponse.Ciphertext))
-	if err != nil {
-		log.Println(err)
-	}
-
-	log.Printf("Root token written to gs://%s/%s", gcsBucketName, "root-token.enc")
+	log.Printf("Root token written to secret %s/%s", k8sNamespace, k8sSecretName)
 
 	log.Println("Initialization complete.")
 }
 
 func unseal() {
-	bucket := storageClient.Bucket(gcsBucketName)
-
 	ctx := context.Background()
-	unsealKeysObject, err := bucket.Object("unseal-keys.json.enc").NewReader(ctx)
+
+	secret, err := k8sClient.CoreV1().Secrets(k8sNamespace).Get(ctx, k8sSecretName, metav1.GetOptions{})
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	defer unsealKeysObject.Close()
+	unsealKeysBytes, ok := secret.Data["unseal-keys.json.enc"]
+	if !ok {
+		log.Printf("secret %s/%s does not contain unseal keys\n", k8sNamespace, k8sSecretName)
+		return
+	}
 
-	unsealKeysData, err := ioutil.ReadAll(unsealKeysObject)
+	unsealKeys, err := base64.StdEncoding.DecodeString(string(unsealKeysBytes))
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	unsealKeysDecryptRequest := &cloudkms.DecryptRequest{
-		Ciphertext: string(unsealKeysData),
-	}
-
-	unsealKeysDecryptResponse, err := kmsService.Projects.Locations.KeyRings.CryptoKeys.Decrypt(kmsKeyId, unsealKeysDecryptRequest).Do()
+	unsealKeysDecryptResult, err := kmsSvc.Decrypt(&kms.DecryptInput{
+		KeyId:          aws.String(kmsKeyId),
+		CiphertextBlob: unsealKeys,
+	})
 	if err != nil {
 		log.Println(err)
 		return
@@ -343,7 +367,7 @@ func unseal() {
 
 	var initResponse InitResponse
 
-	unsealKeysPlaintext, err := base64.StdEncoding.DecodeString(unsealKeysDecryptResponse.Plaintext)
+	unsealKeysPlaintext, err := base64.StdEncoding.DecodeString(string(unsealKeysDecryptResult.Plaintext))
 	if err != nil {
 		log.Println(err)
 		return
@@ -501,4 +525,13 @@ func durFromEnv(env string, def time.Duration) time.Duration {
 		log.Fatalf("failed to parse %q: %s", env, err)
 	}
 	return d
+}
+
+func getCurrentNamespace() (string, error) {
+	b, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		return "", err
+	}
+
+	return string(b), nil
 }
